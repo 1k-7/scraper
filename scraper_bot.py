@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import sys
+from urllib.parse import urljoin  # <-- IMPORT ADDED
 
 import httpx
 from bs4 import BeautifulSoup
@@ -16,27 +17,21 @@ from telegram.ext import (
 )
 
 # --- Configuration ---
-# Get from environment variables
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 OWNER_ID = os.environ.get("OWNER_ID")
 
-# --- NEW: Data Directory ---
-# All persistent files will be stored here
 DATA_DIR = "data"
-os.makedirs(DATA_DIR, exist_ok=True) # Ensure the directory exists
+os.makedirs(DATA_DIR, exist_ok=True) 
 
-# Files for saving state (now inside DATA_DIR)
 LINKS_FILE = os.path.join(DATA_DIR, "novels.json")
 PROGRESS_FILE = os.path.join(DATA_DIR, "processed_pages.json")
 LOG_FILE = os.path.join(DATA_DIR, "bot.log")
 
-# How many pages to process before saving to disk
 SAVE_BATCH_SIZE = 50
-# Page range
 LAST_PAGE = 5076 
+BASE_DOMAIN = "https://www.fanmtl.com" # <-- ADDED FOR JOINING RELATIVE URLS
 
 # --- Logging ---
-# Log to a file inside the data directory and also to the console
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
@@ -49,17 +44,12 @@ logger = logging.getLogger(__name__)
 
 
 async def save_progress_async(links_set, pages_set):
-    """
-    Saves the links and processed pages to their files
-    asynchronously to avoid blocking the bot.
-    """
+    """Saves progress asynchronously."""
     logger.info("Saving progress to disk...")
     try:
-        # Convert sets to lists for JSON serialization
         links_list = list(links_set)
         pages_list = list(pages_set)
 
-        # Run the blocking json.dump in a separate thread
         await asyncio.to_thread(
             json.dump, links_list, open(LINKS_FILE, "w"), indent=2
         )
@@ -72,10 +62,7 @@ async def save_progress_async(links_set, pages_set):
 
 
 async def periodic_backup(context: ContextTypes.DEFAULT_TYPE):
-    """
-    This job is run by the JobQueue every 10 minutes.
-    It sends the current novels.json file to the owner.
-    """
+    """Sends periodic backup to owner."""
     if not context.bot_data.get('is_scraping'):
         logger.info("Periodic backup: Scraping not active, skipping.")
         return
@@ -88,17 +75,12 @@ async def periodic_backup(context: ContextTypes.DEFAULT_TYPE):
         logger.info("Periodic backup successful.")
     except FileNotFoundError:
         logger.warning("Periodic backup: novels.json not found yet.")
-    except (Forbidden, BadRequest) as e:
-        logger.error(f"Periodic backup: Bot blocked or chat not found. {e}")
     except Exception as e:
         logger.error(f"Periodic backup: Failed to send file: {e}")
 
 
 async def scrape_all_novels(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Main background scraping task.
-    Loads previous state and resumes from where it left off.
-    """
+    """Main background scraping task."""
     chat_id = update.effective_chat.id
     logger.info(f"Scraping task started for chat_id: {chat_id}")
 
@@ -154,7 +136,6 @@ async def scrape_all_novels(update: Update, context: ContextTypes.DEFAULT_TYPE):
     async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
         
         for i, page_num in enumerate(pages_to_scrape):
-            # Check if a /cancel command was issued
             if not context.bot_data.get('is_scraping'):
                 logger.info("Scraping cancelled by user.")
                 await context.bot.send_message(chat_id=chat_id, text="Scraping manually stopped.")
@@ -170,30 +151,43 @@ async def scrape_all_novels(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 soup = BeautifulSoup(r.text, "html.parser")
                 links_found_on_page = 0
+                
+                # --- START OF MODIFIED LOGIC ---
                 for link_tag in soup.find_all("a", href=True):
                     href = link_tag['href']
-                    if href.startswith("https://www.fanmtl.com/novel/"):
-                        if href not in all_novel_links:
-                            all_novel_links.add(href)
+                    
+                    full_url = None
+                    
+                    # Case 1: Relative link (e.g., /novel/some-book)
+                    if href.startswith("/novel/"):
+                        full_url = urljoin(BASE_DOMAIN, href)
+                        
+                    # Case 2: Absolute link (e.g., https://www.fanmtl.com/novel/...)
+                    elif href.startswith(f"{BASE_DOMAIN}/novel/"):
+                        full_url = href
+
+                    # If we found a valid URL, add it
+                    if full_url:
+                        if full_url not in all_novel_links:
+                            all_novel_links.add(full_url)
                             links_found_on_page += 1
-                
-                # Mark page as processed *after* successful parsing
+                # --- END OF MODIFIED LOGIC ---
+
                 processed_pages.add(page_num)
                 save_counter += 1
 
-                if i % 100 == 0: # Log progress every 100 pages
+                if i % 100 == 0: 
                     logger.info(
                         f"[Progress {i}/{total_remaining}] Page {page_num}: "
                         f"Found {links_found_on_page} new links. "
                         f"Total: {len(all_novel_links)}"
                     )
 
-                # Batch save to disk
                 if save_counter >= SAVE_BATCH_SIZE:
                     await save_progress_async(all_novel_links, processed_pages)
-                    save_counter = 0 # Reset counter
+                    save_counter = 0 
 
-                await asyncio.sleep(0.1) # Be nice
+                await asyncio.sleep(0.1) 
 
             except httpx.ReadTimeout:
                 logger.warning(f"Timeout on page {page_num}. Skipping.")
@@ -203,7 +197,6 @@ async def scrape_all_novels(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # --- 4. Final Save & Cleanup ---
     logger.info("Scraping loop finished. Performing final save.")
     await save_progress_async(all_novel_links, processed_pages)
-    
     context.bot_data['is_scraping'] = False
     
     await context.bot.send_message(
@@ -215,7 +208,7 @@ async def scrape_all_novels(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
-# --- Bot Command Handlers ---
+# --- Bot Command Handlers (No changes below this line) ---
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Sends a welcome message."""
@@ -305,34 +298,29 @@ def main():
     """Run the bot."""
     if not TELEGRAM_BOT_TOKEN:
         logger.critical("TELEGRAM_BOT_TOKEN environment variable not set. Exiting.")
-        sys.exit(1) # Exit with an error
+        sys.exit(1)
     if not OWNER_ID:
         logger.critical("OWNER_ID environment variable not set. Exiting.")
-        sys.exit(1) # Exit with an error
+        sys.exit(1)
     
     logger.info(f"Bot starting... Backups will be sent to OWNER_ID: {OWNER_ID}")
 
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-
-    # Store flags in bot_data for global access
     application.bot_data['is_scraping'] = False
-
-    # --- Setup the 10-minute periodic backup ---
+    
     job_queue = application.job_queue
     job_queue.run_repeating(
         periodic_backup,
-        interval=600,  # 600 seconds = 10 minutes
-        first=60       # Start after 60 seconds
+        interval=600,
+        first=60
     )
 
-    # --- Add command handlers ---
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("scrape", start_scraping_command))
     application.add_handler(CommandHandler("cancel", cancel_scraping_command))
     application.add_handler(CommandHandler("get_links", get_links_command))
     application.add_handler(CommandHandler("get_progress", get_progress_command))
     application.add_handler(CommandHandler("get_all", get_all_files))
-
 
     logger.info("Bot is starting to poll...")
     application.run_polling()
